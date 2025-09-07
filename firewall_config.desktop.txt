@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=ZenWall
+Comment=Manage firewall and network settings with Zenity GUI
+Exec=gnome-terminal -- bash -c "sudo /home/vboxuser/firewall_config.sh"
+Icon=utilities-terminal
+Terminal=false
+Categories=System;Network;

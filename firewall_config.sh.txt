@@ -1,0 +1,167 @@
+#!/bin/bash
+
+LOG_FILE="/home/${SUDO_USER:-$USER}/firewall_network.log"
+BACKUP_FILE="/home/${SUDO_USER:-$USER}/ufw_rules_backup.txt"
+mkdir -p "$(dirname "$LOG_FILE")"
+
+if [ "$EUID" -ne 0 ]; then
+  zenity --error --text="Please run this script as root." --width=400 --height=150
+  exit 1
+fi
+
+REQUIRED_CMDS=(zenity ufw ss ip nmap iftop iptables)
+for CMD in "${REQUIRED_CMDS[@]}"; do
+  if ! command -v $CMD &> /dev/null; then
+    zenity --error --text="$CMD is not installed. Please install it." --width=400 --height=150
+    exit 1
+  fi
+done
+
+log_error() { echo "[$(date '+%d-%b-%Y %H:%M:%S')] ERROR: [$USER - $(hostname)] $1" >> "${LOG_FILE/.log/_error.log}"; }
+log_action() { echo "[$(date '+%d-%b-%Y %H:%M:%S')] [$USER - $(hostname)] $1" >> "$LOG_FILE"; }
+show_info() { zenity --info --text="$1" --width=400 --height=150; }
+show_error() { zenity --error --text="$1" --width=400 --height=150; }
+validate_port() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && [ "$1" -le 65535 ]; }
+validate_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+display_network_info() {
+  local interfaces=$(ip -o link show | awk -F': ' '{print $2}')
+  local info=""
+
+  for iface in $interfaces; do
+    [[ "$iface" == "lo" || "$iface" == docker* ]] && continue
+    ip_address=$(ip -f inet addr show "$iface" | awk '/inet / {print $2}')
+    mac_address=$(cat /sys/class/net/"$iface"/address)
+    state=$(cat /sys/class/net/"$iface"/operstate)
+    info+="Interface: $iface\n  IP: ${ip_address:-N/A}\n  MAC: $mac_address\n  State: $state\n\n"
+  done
+
+  [ -z "$info" ] && info="No active network interfaces found." && log_error "No network interfaces detected"
+  echo -e "$info" | zenity --text-info --title="Network Information" --width=600 --height=400
+  log_action "Displayed network information"
+}
+
+scan_open_ports() {
+  nmap -sS -Pn 127.0.0.1 > /tmp/nmap_scan.txt
+  zenity --text-info --filename=/tmp/nmap_scan.txt --width=800 --height=500 --title="Open Ports Scan"
+  log_action "Scanned open ports using nmap"
+}
+
+monitor_bandwidth() {
+  gnome-terminal -- bash -c "iftop -n -i $(ip route | grep default | awk '{print $5}'); exec bash"
+  log_action "Launched bandwidth monitoring using iftop"
+}
+
+strict_lockdown() {
+  IP=$(zenity --entry --title="Strict Lockdown Mode" --text="Enter IP to whitelist:")
+  if validate_ip "$IP"; then
+    ufw status numbered > "$BACKUP_FILE"
+    ufw reset
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow from $IP
+    ufw enable
+    show_info "Lockdown enabled. Only $IP allowed.\nPrevious rules backed up."
+    log_action "Enabled lockdown; allowed IP: $IP"
+  else
+    show_error "Invalid IP address."
+  fi
+}
+
+restore_rules() {
+  if [[ -f "$BACKUP_FILE" ]]; then
+    ufw reset
+    while read -r line; do
+      rule=$(echo "$line" | sed 's/\[[0-9]*\]//g')
+      ufw "$rule" 2>/dev/null
+    done < <(grep -E "ALLOW|DENY|REJECT" "$BACKUP_FILE")
+    ufw enable
+    show_info "Firewall rules restored from backup."
+    log_action "Restored firewall rules from $BACKUP_FILE"
+  else
+    show_error "No backup found."
+  fi
+}
+
+firewall_snapshot() {
+  SNAPSHOT="/home/${SUDO_USER:-$USER}/firewall_snapshot_$(date '+%d-%b-%Y_%H-%M-%S').txt"
+  {
+    echo "==== UFW STATUS ===="
+    ufw status verbose
+    echo -e "\n==== IPTABLES (Packet Stats) ===="
+    iptables -L -v -n
+  } > "$SNAPSHOT"
+  zenity --text-info --filename="$SNAPSHOT" --title="Firewall Snapshot" --width=800 --height=500
+  log_action "Saved firewall snapshot to $SNAPSHOT"
+}
+
+monitor_logs_realtime() {
+  gnome-terminal -- bash -c "tail -f /var/log/ufw.log; exec bash"
+  log_action "Started realtime log monitor"
+}
+
+show_firewall_statistics() {
+  {
+    echo "==== UFW STATUS ===="
+    ufw status verbose
+    echo ""
+    echo "==== IPTABLES (Packet Counts) ===="
+    iptables -L -v -n
+    echo ""
+    echo "==== APPLICATION PROFILES ===="
+    ufw app list
+  } > /tmp/fw_stats.txt
+  zenity --text-info --filename=/tmp/fw_stats.txt --width=800 --height=500 --title="Firewall Statistics"
+  log_action "Viewed extended firewall statistics"
+}
+
+main_menu() {
+  CHOICE=$(zenity --list --radiolist \
+    --title="ZenWall" --width=700 --height=700 \
+    --column "Select" --column "Option" \
+    TRUE "Enable Firewall" \
+    FALSE "Disable Firewall" \
+    FALSE "Allow a Port" \
+    FALSE "Deny a Port" \
+    FALSE "Block an IP Address" \
+    FALSE "Unblock an IP Address" \
+    FALSE "Show Firewall Statistics" \
+    FALSE "Suspicious IP Monitor" \
+    FALSE "Monitor Bandwidth" \
+    FALSE "Strict Firewall Lockdown" \
+    FALSE "Restore Previous Rules" \
+    FALSE "Scan Open Ports" \
+    FALSE "Realtime Log Monitor" \
+    FALSE "Firewall Snapshot" \
+    FALSE "Display Network Information")
+
+  [[ $? -ne 0 ]] && log_action "User exited the menu." && exit 0
+
+  case "$CHOICE" in
+    "Enable Firewall") ufw enable && show_info "Firewall Enabled." && log_action "Enabled firewall" ;;
+    "Disable Firewall") ufw disable && show_info "Firewall Disabled." && log_action "Disabled firewall" ;;
+    "Allow a Port") PORT=$(zenity --entry --title="Allow Port" --text="Enter port:")
+                    validate_port "$PORT" && ufw allow "$PORT" && show_info "Port $PORT allowed." && log_action "Allowed port $PORT" || show_error "Invalid port." ;;
+    "Deny a Port") PORT=$(zenity --entry --title="Deny Port" --text="Enter port:")
+                   validate_port "$PORT" && ufw deny "$PORT" && show_info "Port $PORT denied." && log_action "Denied port $PORT" || show_error "Invalid port." ;;
+    "Block an IP Address") IP=$(zenity --entry --title="Block IP" --text="Enter IP:")
+                           validate_ip "$IP" && ufw deny from "$IP" && show_info "Blocked $IP" && log_action "Blocked IP $IP" || show_error "Invalid IP." ;;
+    "Unblock an IP Address") IP=$(zenity --entry --title="Unblock IP" --text="Enter IP:")
+                             validate_ip "$IP" && ufw delete deny from "$IP" && show_info "Unblocked $IP" && log_action "Unblocked IP $IP" || show_error "Invalid IP." ;;
+    "Show Firewall Statistics") show_firewall_statistics ;;
+    "Suspicious IP Monitor") ss -tunap | grep -E ':21|:23|:3389|:1433|:5900|:5555' > /tmp/suspicious.txt
+                             [[ -s /tmp/suspicious.txt ]] && zenity --warning --text="Suspicious activity found." && zenity --text-info --filename=/tmp/suspicious.txt --title="Suspicious Activity" && log_action "Suspicious ports detected" || show_info "No suspicious activity." && log_action "Clean suspicious IP check" ;;
+    "Monitor Bandwidth") monitor_bandwidth ;;
+    "Strict Firewall Lockdown") strict_lockdown ;;
+    "Restore Previous Rules") restore_rules ;;
+    "Scan Open Ports") scan_open_ports ;;
+    "Realtime Log Monitor") monitor_logs_realtime ;;
+    "Firewall Snapshot") firewall_snapshot ;;
+    "Display Network Information") display_network_info ;;
+    *) show_error "Invalid choice." ;;
+  esac
+}
+
+while true; do
+  main_menu
+done
